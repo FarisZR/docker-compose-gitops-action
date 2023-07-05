@@ -57,6 +57,7 @@ runs:
 
     - name: "Check SSH keys"
       if: ${{ inputs.tailscale_ssh == '' }}
+      shell: bash
       run: |
         echo "Normal SSH mode, checking SSH keys"
         if [ -z "$INPUT_SSH_PUBLIC_KEY" ]; then
@@ -155,7 +156,7 @@ runs:
         docker ${INPUT_ARGS} stack deploy --compose-file ${INPUT_COMPOSE_FILE_PATH}
     
     - name: "Deploy Compose file"
-      if: ${{ inputs.docker_swarm = '' }}
+      if: ${{ inputs.docker_swarm == '' }}
       shell: bash
       run: |
         echo "::notice Command: docker compose -f ${INPUT_COMPOSE_FILE_PATH} pull"
