@@ -98,7 +98,10 @@ runs:
         #chmod 600 "~/.ssh"
         eval $(ssh-agent)
         ssh-add ~/.ssh/id_rsa
-        echo "Adding known hosts"
+
+    - name: Adding known host
+      shell: bash
+      run: |
         ssh-keyscan -p $INPUT_SSH_PORT "$SSH_HOST" >> ~/.ssh/known_hosts
         ssh-keyscan -p $INPUT_SSH_PORT "$SSH_HOST" >> /etc/ssh/ssh_known_hosts
 
