@@ -77,17 +77,20 @@ runs:
         exit 1
 
     - name: "Set DOCKER_HOST and SSH_HOST"
+      shell: bash
       run: |
         DOCKER_HOST=ssh://\${INPUT_REMOTE_DOCKER_HOST}:\${INPUT_SSH_PORT}
         SSH_HOST=\${INPUT_REMOTE_DOCKER_HOST#*@}
 
     - name: starting SSH agent
+      shell: bash
       run: |
           mkdir -p ~/.ssh
           eval $(ssh-agent)
 
     - name: "Register SSH keys"
       if: ${{ inputs.tailscale_ssh == '' }}
+      shell: bash
       run: |
         echo "Registering SSH keys..."
         ls ~/.ssh
@@ -106,11 +109,13 @@ runs:
         ssh-keyscan -p $INPUT_SSH_PORT "$SSH_HOST" >> /etc/ssh/ssh_known_hosts
 
     - name: "Create docker context"
+      shell: bash
       run: |
         docker context create remote --docker "host=ssh://$INPUT_REMOTE_DOCKER_HOST:$INPUT_SSH_PORT"
         docker context use remote
 
     - name: "Check docker compose directory"
+      shell: bash
       if: ${{ inputs.upload_directory }}
       run: |
         if [ -z "$INPUT_DOCKER_COMPOSE_DIRECTORY" ]; 
@@ -120,12 +125,14 @@ runs:
         fi
 
     - name: "Upload directory"
+      shell: bash
       if: ${{ inputs.upload_directory }}
       run: |
         tar cjvf - -C "$GITHUB_WORKSPACE" "$INPUT_DOCKER_COMPOSE_DIRECTORY" | ssh -o StrictHostKeyChecking=no "$INPUT_REMOTE_DOCKER_HOST" -p "$INPUT_SSH_PORT" 'tar -xjvf -'
         echo "Upload finished"
 
     - name: "Run post upload command"
+      shell: bash
       if: ${{ inputs.post_upload_command }}
       run: |
         then
@@ -133,6 +140,7 @@ runs:
         ssh -o StrictHostKeyChecking=no "$INPUT_REMOTE_DOCKER_HOST" -p "$INPUT_SSH_PORT" "eval $INPUT_POST_UPLOAD_COMMAND"
 
     - name: "Connect to docker registry"
+      shell: bash
       if: ${{ inputs.docker_login_user &&	inputs.docker_login_password &&inputs.docker_login_registry }}
       run: |
         echo "::notice Connecting to $INPUT_REMOTE_DOCKER_HOST... Command: docker login"
@@ -140,6 +148,7 @@ runs:
 
     - name: "Deploy Stack file to swarm"
       if: ${{ inputs.docker_swarm }}
+      shell: bash
       run: |
         echo "docker swarm mode enabled, using docker stack command"
         echo "Command: docker ${INPUT_ARGS} stack deploy --compose-file ${INPUT_COMPOSE_FILE_PATH}"
@@ -147,6 +156,7 @@ runs:
     
     - name: "Deploy Compose file"
       if: ${{ inputs.docker_swarm = '' }}
+      shell: bash
       run: |
         echo "::notice Command: docker compose -f ${INPUT_COMPOSE_FILE_PATH} pull"
         docker compose -f ${INPUT_COMPOSE_FILE_PATH} pull
