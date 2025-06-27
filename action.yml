@@ -1,29 +1,35 @@
-name: Docker-Compose gitops action
-author: FarisZR
-description: A GitHub Action making gitops with docker-compose easy.
+name: Docker-Compose gitops action (Composite)
+author: FarisZR (Composite by AI)
+description: A GitHub Action making gitops with docker-compose easy (Composite Version).
 inputs:
   remote_docker_host:
     description: Remote Docker host ie (user@host)
     required: true
   ssh_public_key:
     description: Remote Docker SSH public key
+    required: false # Not required if tailscale_ssh is true
   ssh_private_key:
     description: SSH private key used to connect to the docker host
+    required: false # Not required if tailscale_ssh is true
   tailscale_ssh:
     description: Use Tailscale SSH to conncet to the server with managed SSH keys
     required: false
+    default: 'false'
   args:
     description: Deployment command args.
     required: true
   compose_file_path:
     description: path for Docker compose file used. Default is is repo root(docker-compose.yml)
     required: false
+    default: 'docker-compose.yml'
   ssh_port:
     description: The ssh port of the server. Default is 22
     required: false
+    default: '22'
   upload_directory:
     description: when enabled, uploads entire docker directory, useful for configuration files needed along the container
     required: false
+    default: 'false'
   post_upload_command:
     description: sets command to run post upload, useful to fix permission issues in configuration files
     required: false
@@ -36,6 +42,7 @@ inputs:
   docker_swarm:
     description: enables docker swarm mode (docker stack deploy), defaults to false
     required: false
+    default: 'false'
   docker_login_user:
     description: The docker login user
     required: false
@@ -44,11 +51,140 @@ inputs:
     required: false
 
 runs:
-  using: docker
-  image: 'Dockerfile'
+  using: "composite"
+  steps:
+    - name: Input Validation and Defaults
+      shell: bash
+      run: |
+        if [[ -z "${{ inputs.remote_docker_host }}" ]]; then
+          echo "Input remote_docker_host is required!"
+          exit 1
+        fi
 
+        if [[ "${{ inputs.tailscale_ssh }}" == "false" ]]; then
+          if [[ -z "${{ inputs.ssh_public_key }}" ]]; then
+            echo "Input ssh_public_key is required when not using Tailscale SSH!"
+            exit 1
+          fi
+          if [[ -z "${{ inputs.ssh_private_key }}" ]]; then
+            echo "Input ssh_private_key is required when not using Tailscale SSH!"
+            exit 1
+          fi
+        else
+          echo "Tailscale SSH mode enabled. Manual SSH keys not required if Tailscale handles SSH agent."
+        fi
+
+        if [[ -z "${{ inputs.args }}" ]]; then
+          echo "Input args is required!"
+          exit 1
+        fi
+        echo "COMPOSE_FILE_PATH=${{ inputs.compose_file_path }}"
+        echo "SSH_PORT=${{ inputs.ssh_port }}"
+
+    - name: Setup SSH
+      shell: bash
+      run: |
+        set -eu
+        SSH_USER_HOST="${{ inputs.remote_docker_host }}"
+        SSH_HOST=$(echo "$SSH_USER_HOST" | sed 's/.*@//') # Extract host part
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        if [[ "${{ inputs.tailscale_ssh }}" == "true" ]]; then
+          echo "Using Tailscale SSH. Assuming ssh-agent is managed by Tailscale or started if needed."
+          # Start ssh-agent if not already running (common practice for Tailscale SSH scenarios)
+          # The original script started ssh-agent even for Tailscale.
+          # However, Tailscale's own SSH often injects keys directly or expects agent to be running.
+          # For safety, we can ensure it's running.
+          if ! ssh-add -l >/dev/null 2>&1; then
+            echo "Starting ssh-agent for Tailscale SSH..."
+            eval $(ssh-agent -s)
+          else
+            echo "ssh-agent already running or has keys."
+          fi
+        else
+          echo "Registering SSH keys..."
+          echo "${{ inputs.ssh_private_key }}" > ~/.ssh/id_rsa
+          echo "${{ inputs.ssh_public_key }}" > ~/.ssh/id_rsa.pub
+          chmod 600 ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa.pub
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_rsa
+        fi
+
+        echo "Adding known hosts for $SSH_HOST on port ${{ inputs.ssh_port }}"
+        ssh-keyscan -p "${{ inputs.ssh_port }}" "$SSH_HOST" >> ~/.ssh/known_hosts
+        # Also add to system known_hosts for some tools that might look there, though user's known_hosts is primary for ssh client
+        sudo mkdir -p /etc/ssh
+        sudo ssh-keyscan -p "${{ inputs.ssh_port }}" "$SSH_HOST" >> /etc/ssh/ssh_known_hosts
+
+
+    - name: Setup Docker Context
+      shell: bash
+      run: |
+        set -eu
+        echo "Creating Docker context 'remote' for host ssh://${{ inputs.remote_docker_host }}:${{ inputs.ssh_port }}"
+        docker context create remote --docker "host=ssh://${{ inputs.remote_docker_host }}:${{ inputs.ssh_port }}"
+        docker context use remote
+        echo "Docker context 'remote' created and selected."
+        docker ps # Test command to verify context
+
+    - name: Upload Directory
+      if: inputs.upload_directory == 'true'
+      shell: bash
+      run: |
+        set -eu
+        if [[ -z "${{ inputs.docker_compose_directory }}" ]]; then
+          echo "Input docker_compose_directory is required when upload_directory is enabled!"
+          exit 1
+        fi
+        echo "Uploading directory '${{ inputs.docker_compose_directory }}' from $GITHUB_WORKSPACE to ${{ inputs.remote_docker_host }}..."
+        # Use ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null if issues with known_hosts persist for this specific command
+        tar cjvf - -C "$GITHUB_WORKSPACE" "${{ inputs.docker_compose_directory }}" | ssh -p "${{ inputs.ssh_port }}" "${{ inputs.remote_docker_host }}" 'tar -xjvf -'
+        echo "Upload finished."
+
+        if [[ -n "${{ inputs.post_upload_command }}" ]]; then
+          echo "Running post-upload command: ${{ inputs.post_upload_command }}"
+          ssh -p "${{ inputs.ssh_port }}" "${{ inputs.remote_docker_host }}" "eval ${{ inputs.post_upload_command }}"
+        fi
+
+    - name: Docker Login
+      if: inputs.docker_login_password != '' || inputs.docker_login_user != '' || inputs.docker_login_registry != ''
+      shell: bash
+      run: |
+        set -eu
+        if [[ -z "${{ inputs.docker_login_user }}" || -z "${{ inputs.docker_login_password }}" ]]; then
+          echo "Both docker_login_user and docker_login_password are required if one is provided for Docker login."
+          # exit 1 # Decide if this should be a fatal error or just a warning
+        fi
+        echo "Attempting Docker login to '${{ inputs.docker_login_registry || 'Docker Hub' }}'..."
+        docker login -u "${{ inputs.docker_login_user }}" --password-stdin <<< "${{ inputs.docker_login_password }}" ${{ inputs.docker_login_registry }}
+        echo "Docker login successful."
+
+    - name: Execute Docker Command
+      shell: bash
+      run: |
+        set -eu
+        DOCKER_COMPOSE_COMMAND="docker compose"
+        if [[ "${{ inputs.docker_swarm }}" == "true" ]]; then
+          echo "Docker Swarm mode enabled. Using 'docker stack deploy'."
+          # Note: INPUT_ARGS in the original script was `docker ${INPUT_ARGS} stack deploy ...`
+          # This implies INPUT_ARGS could contain global docker options like --log-level.
+          # For simplicity here, assuming args are primarily for the deploy command itself.
+          # If INPUT_ARGS needs to be split for docker global options vs stack deploy options, this needs refinement.
+          echo "Command: docker ${{ inputs.args }} stack deploy --compose-file ${{ inputs.compose_file_path }}"
+          docker ${{ inputs.args }} stack deploy --compose-file "${{ inputs.compose_file_path }}"
+        else
+          echo "Using Docker Compose."
+          COMPOSE_FILE_ARG="-f ${{ inputs.compose_file_path }}"
+          echo "Pulling images for compose file: ${{ inputs.compose_file_path }}"
+          $DOCKER_COMPOSE_COMMAND $COMPOSE_FILE_ARG pull
+
+          echo "Executing compose command: $DOCKER_COMPOSE_COMMAND $COMPOSE_FILE_ARG ${{ inputs.args }}"
+          $DOCKER_COMPOSE_COMMAND $COMPOSE_FILE_ARG ${{ inputs.args }}
+        fi
+        echo "Docker command executed."
 
 branding:
   icon: upload-cloud
-  color: orange
-
+  color: green # Changed color to distinguish from original
