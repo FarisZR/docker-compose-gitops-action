@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       sshd:
-        image: rastasheep/ubuntu-sshd:22.04 # Pinned version
+        image: rastasheep/ubuntu-sshd:jammy # Updated to jammy for Ubuntu 22.04
         ports:
           - 2222:22
         # We will configure the sshd service using a step below
