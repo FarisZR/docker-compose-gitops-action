@@ -7,268 +7,193 @@ jobs:
     runs-on: ubuntu-latest
     services:
       sshd:
-        image: rastasheep/ubuntu-sshd:latest # Using :latest, consider pinning to a specific version like 18.04 or 22.04
+        image: rastasheep/ubuntu-sshd:22.04 # Pinned version
         ports:
-          - 2222:22 # Map container port 22 to host port 2222
+          - 2222:22
+        # We will configure the sshd service using a step below
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Generate SSH keys for testing
+      - name: Generate SSH keys & Configure Service Container
+        id: ssh_setup # Give an id to this step to reference its outputs
         run: |
-          ssh-keygen -t rsa -b 4096 -f test_ssh_key -N ""
-          cat test_ssh_key.pub >> ~/.ssh/authorized_keys # Add to runner's authorized_keys for simplicity in some tests if needed
-          sudo apt-get update && sudo apt-get install -y sshpass # For non-interactive password auth to service container if needed for setup
-          echo "Generated SSH keys: test_ssh_key and test_ssh_key.pub"
-          echo "Public key content:"
-          cat test_ssh_key.pub
-          echo "Private key content for action input:"
-          cat test_ssh_key
-          # This is to authorize the runner to SSH into the service container
-          # The service container 'rastasheep/ubuntu-sshd' uses root/root by default or SSH key if configured
-          # We need to get the public key into the service container's authorized_keys
-          # For rastasheep/ubuntu-sshd, it allows password auth (root/root) or you can set SSH_USERPASS or AUTHORIZED_KEYS env var.
-          # Let's try to use password auth to inject the key initially for simplicity of testing the action's key mechanism.
-          # The action itself will use key-based auth.
-          echo "Waiting for SSH service to be ready..."
-          until sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "echo Connected"; do
+          # Generate SSH keys
+          ssh-keygen -t rsa -b 2048 -f test_ssh_key -N ""
+          sudo apt-get update && sudo apt-get install -y sshpass netcat-openbsd
+
+          echo "Waiting for SSH service (localhost:2222) to be ready..."
+          MAX_WAIT_ATTEMPTS=12 # Wait for up to 60 seconds (12 * 5s)
+          CURRENT_WAIT_ATTEMPT=0
+          until nc -zv localhost 2222; do
+            CURRENT_WAIT_ATTEMPT=$((CURRENT_WAIT_ATTEMPT+1))
+            if [ $CURRENT_WAIT_ATTEMPT -gt $MAX_WAIT_ATTEMPTS ]; then
+              echo "Service sshd on port 2222 did not become available."
+              exit 1
+            fi
+            echo "Waiting for port 2222... attempt $CURRENT_WAIT_ATTEMPT"
             sleep 5
           done
-          echo "SSH service is ready."
-          sshpass -p root scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P 2222 test_ssh_key.pub root@localhost:/root/.ssh/authorized_keys
-          echo "Copied generated public key to service container's authorized_keys for root user."
+          echo "SSH service port is open."
+
+          echo "Ensuring /root/.ssh directory exists on service container..."
+          sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "mkdir -p /root/.ssh && chmod 700 /root/.ssh" || { echo "Failed to create /root/.ssh on service container"; exit 1; }
+
+          echo "Attempting to copy SSH public key to service container..."
+          MAX_SCP_ATTEMPTS=5
+          COUNT=0
+          while [ $COUNT -lt $MAX_SCP_ATTEMPTS ]; do
+            sshpass -p root scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P 2222 ./test_ssh_key.pub root@localhost:/root/.ssh/authorized_keys && break
+            COUNT=$((COUNT+1))
+            echo "SSH key copy attempt $COUNT failed. Retrying in 5s..."
+            sleep 5
+          done
+          if [ $COUNT -eq $MAX_SCP_ATTEMPTS ]; then
+            echo "Failed to copy SSH key to service container after $MAX_SCP_ATTEMPTS attempts."
+            # For debugging, show if the .ssh directory exists
+            sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "ls -la /root/ && ls -la /root/.ssh/" || echo "Failed to list /root/.ssh on service."
+            exit 1
+          fi
+          echo "Copied generated public key to service container's /root/.ssh/authorized_keys."
+
+          # Output keys for other steps
+          # Need to escape multi-line private key for ::set-output (deprecated) or GITHUB_OUTPUT
+          # Using GITHUB_OUTPUT format
+          echo "private_key<<EOF" >> $GITHUB_OUTPUT
+          cat test_ssh_key >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "public_key=$(cat test_ssh_key.pub)" >> $GITHUB_OUTPUT
+          echo "Generated and set SSH key outputs for use in subsequent steps."
 
       - name: Setup Mock Docker Command
         run: |
-          # Create a mock docker command that records calls
           echo '#!/bin/bash' > ./docker_mock.sh
           echo 'echo "DOCKER_MOCK_CALLED_WITH: $@" >> /tmp/docker_calls.log' >> ./docker_mock.sh
-          # For commands that need to produce some output to not break scripts:
           echo 'if [[ "$1" == "context" && "$2" == "create" ]]; then echo "Context created"; exit 0; fi' >> ./docker_mock.sh
           echo 'if [[ "$1" == "context" && "$2" == "use" ]]; then echo "Context used"; exit 0; fi' >> ./docker_mock.sh
           echo 'if [[ "$1" == "ps" ]]; then echo "CONTAINER ID   IMAGE COMMAND"; exit 0; fi' >> ./docker_mock.sh
           echo 'if [[ "$1" == "login" ]]; then echo "Login Succeeded"; exit 0; fi' >> ./docker_mock.sh
           echo 'if [[ "$1" == "compose" && "$3" == "pull" ]]; then echo "Pulling done"; exit 0; fi' >> ./docker_mock.sh
-          # Add more specific mocks as needed for other commands like compose up/down or stack deploy
-          echo 'exit 0' >> ./docker_mock.sh # Default exit 0 for other commands
+          echo 'if [[ "$1" == "compose" ]]; then echo "Compose command executed"; exit 0; fi' >> ./docker_mock.sh
+          echo 'if [[ "$1" == "stack" && "$2" == "deploy" ]]; then echo "Stack deploy command executed"; exit 0; fi' >> ./docker_mock.sh
+          echo 'exit 0' >> ./docker_mock.sh
           chmod +x ./docker_mock.sh
-          echo "$PWD/docker_mock.sh" > /tmp/docker_path_override
-          sudo ln -s "$PWD/docker_mock.sh" /usr/local/bin/docker # Override docker command
-          echo "Mock Docker command setup at /usr/local/bin/docker"
-          # Clear log file at the beginning of each test run section might be good
+          sudo ln -sf "$PWD/docker_mock.sh" /usr/local/bin/docker
+          echo "Mock Docker command setup at /usr/local/bin/docker. Calls logged to /tmp/docker_calls.log"
+          # Ensure log file is clean before first test
           rm -f /tmp/docker_calls.log
 
-      # --- Test Case 1: Basic SSH Connection & Docker Context ---
-      - name: Test 1 - Basic SSH and Docker Context
-        id: test1
+      # --- Test Case 1: Basic SSH and Docker Context (Compose ps) ---
+      - name: Test 1 - Basic SSH, Docker Context, Compose
         uses: ./ # Uses the composite action in the root of the repository
         with:
           remote_docker_host: root@localhost
           ssh_port: 2222
-          ssh_private_key: ${{ env.TEST_SSH_PRIVATE_KEY }} # Will be set in a prior step
-          ssh_public_key: ${{ env.TEST_SSH_PUBLIC_KEY }} # Will be set in a prior step
-          args: "ps" # Simple command like 'ps' for compose
-        env:
-          TEST_SSH_PRIVATE_KEY: |
-            -----BEGIN RSA PRIVATE KEY-----
-            REPLACE_WITH_GENERATED_PRIVATE_KEY
-            -----END RSA PRIVATE KEY-----
-          TEST_SSH_PUBLIC_KEY: ssh-rsa REPLACE_WITH_GENERATED_PUBLIC_KEY
+          ssh_private_key: ${{ steps.ssh_setup.outputs.private_key }}
+          ssh_public_key: ${{ steps.ssh_setup.outputs.public_key }}
+          args: "ps" # For docker compose ps
 
       - name: Verify Test 1
         shell: bash
         run: |
           echo "Verifying Test 1..."
-          # Check if SSH connection was attempted (indirectly, by docker context trying to use it)
-          # The action's "Setup Docker Context" step runs 'docker ps'
-          # Our mock docker will log this.
-          echo "Docker calls log:"
+          if [ ! -f /tmp/docker_calls.log ]; then echo "Docker log not found!"; exit 1; fi
           cat /tmp/docker_calls.log
-          grep -q "DOCKER_MOCK_CALLED_WITH: context create remote --docker host=ssh://root@localhost:2222" /tmp/docker_calls.log || (echo "Docker context create not called as expected" && exit 1)
-          grep -q "DOCKER_MOCK_CALLED_WITH: context use remote" /tmp/docker_calls.log || (echo "Docker context use not called as expected" && exit 1)
-          grep -q "DOCKER_MOCK_CALLED_WITH: ps" /tmp/docker_calls.log || (echo "Initial docker ps not called as expected by action" && exit 1)
-          # Check that the final 'docker compose -f docker-compose.yml ps' was attempted
-          grep -q "DOCKER_MOCK_CALLED_WITH: compose -f docker-compose.yml ps" /tmp/docker_calls.log || (echo "Final docker compose ps not called as expected" && exit 1)
+          grep -q "DOCKER_MOCK_CALLED_WITH: context create remote --docker host=ssh://root@localhost:2222" /tmp/docker_calls.log || exit 1
+          grep -q "DOCKER_MOCK_CALLED_WITH: context use remote" /tmp/docker_calls.log || exit 1
+          grep -q "DOCKER_MOCK_CALLED_WITH: ps" /tmp/docker_calls.log || exit 1 # From action's context setup test
+          grep -q "DOCKER_MOCK_CALLED_WITH: compose -f docker-compose.yml pull" /tmp/docker_calls.log || exit 1
+          grep -q "DOCKER_MOCK_CALLED_WITH: compose -f docker-compose.yml ps" /tmp/docker_calls.log || exit 1
           echo "Test 1 Verification Successful"
-          rm -f /tmp/docker_calls.log # Clean for next test
+          rm -f /tmp/docker_calls.log
 
       # --- Test Case 2: Upload Directory ---
       - name: Test 2 - Upload Directory
-        id: test2
         uses: ./
         with:
           remote_docker_host: root@localhost
           ssh_port: 2222
-          ssh_private_key: ${{ env.TEST_SSH_PRIVATE_KEY }}
-          ssh_public_key: ${{ env.TEST_SSH_PUBLIC_KEY }}
+          ssh_private_key: ${{ steps.ssh_setup.outputs.private_key }}
+          ssh_public_key: ${{ steps.ssh_setup.outputs.public_key }}
           upload_directory: 'true'
-          docker_compose_directory: '.github' # Upload the .github directory for testing
-          args: "ps" # Dummy args
-        env:
-          TEST_SSH_PRIVATE_KEY: |
-            -----BEGIN RSA PRIVATE KEY-----
-            REPLACE_WITH_GENERATED_PRIVATE_KEY
-            -----END RSA PRIVATE KEY-----
-          TEST_SSH_PUBLIC_KEY: ssh-rsa REPLACE_WITH_GENERATED_PUBLIC_KEY
+          docker_compose_directory: '.github' # Upload this directory for testing
+          args: "ps" # Dummy args for compose
+          post_upload_command: "mkdir -p /tmp && echo 'post_upload_executed' > /tmp/post_upload.txt"
 
       - name: Verify Test 2
         shell: bash
         run: |
           echo "Verifying Test 2..."
-          # Check if the uploaded directory exists on the service container
-          sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "ls -d /root/.github/workflows" || (echo "Uploaded directory not found on service container" && exit 1)
+          sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "ls -d /root/.github/workflows" || (echo "Uploaded directory not found" && exit 1)
+          sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "cat /tmp/post_upload.txt | grep 'post_upload_executed'" || (echo "Post upload command verification failed" && exit 1)
           echo "Test 2 Verification Successful"
-          # Cleanup uploaded directory on service container
-          sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "rm -rf /root/.github"
-          rm -f /tmp/docker_calls.log # Clean for next test
+          sshpass -p root ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@localhost "rm -rf /root/.github /tmp/post_upload.txt"
+          rm -f /tmp/docker_calls.log
 
       # --- Test Case 3: Docker Swarm Mode ---
       - name: Test 3 - Docker Swarm Mode
-        id: test3
         uses: ./
         with:
           remote_docker_host: root@localhost
           ssh_port: 2222
-          ssh_private_key: ${{ env.TEST_SSH_PRIVATE_KEY }}
-          ssh_public_key: ${{ env.TEST_SSH_PUBLIC_KEY }}
+          ssh_private_key: ${{ steps.ssh_setup.outputs.private_key }}
+          ssh_public_key: ${{ steps.ssh_setup.outputs.public_key }}
           docker_swarm: 'true'
           args: "deploy --prune myapp" # Example swarm args
           compose_file_path: "docker-stack.yml"
-        env:
-          TEST_SSH_PRIVATE_KEY: |
-            -----BEGIN RSA PRIVATE KEY-----
-            REPLACE_WITH_GENERATED_PRIVATE_KEY
-            -----END RSA PRIVATE KEY-----
-          TEST_SSH_PUBLIC_KEY: ssh-rsa REPLACE_WITH_GENERATED_PUBLIC_KEY
 
       - name: Verify Test 3
         shell: bash
         run: |
           echo "Verifying Test 3..."
+          if [ ! -f /tmp/docker_calls.log ]; then echo "Docker log not found!"; exit 1; fi
           cat /tmp/docker_calls.log
-          grep -q "DOCKER_MOCK_CALLED_WITH: deploy --prune myapp stack deploy --compose-file docker-stack.yml" /tmp/docker_calls.log || (echo "Docker stack deploy not called as expected" && exit 1)
+          grep -q "DOCKER_MOCK_CALLED_WITH: deploy --prune myapp stack deploy --compose-file docker-stack.yml" /tmp/docker_calls.log || exit 1
           echo "Test 3 Verification Successful"
           rm -f /tmp/docker_calls.log
 
       # --- Test Case 4: Docker Login ---
       - name: Test 4 - Docker Login
-        id: test4
         uses: ./
         with:
           remote_docker_host: root@localhost
           ssh_port: 2222
-          ssh_private_key: ${{ env.TEST_SSH_PRIVATE_KEY }}
-          ssh_public_key: ${{ env.TEST_SSH_PUBLIC_KEY }}
-          args: "ps"
+          ssh_private_key: ${{ steps.ssh_setup.outputs.private_key }}
+          ssh_public_key: ${{ steps.ssh_setup.outputs.public_key }}
+          args: "ps" # Dummy args
           docker_login_user: "testuser"
           docker_login_password: "testpassword"
           docker_login_registry: "fakeregistry.com"
-        env:
-          TEST_SSH_PRIVATE_KEY: |
-            -----BEGIN RSA PRIVATE KEY-----
-            REPLACE_WITH_GENERATED_PRIVATE_KEY
-            -----END RSA PRIVATE KEY-----
-          TEST_SSH_PUBLIC_KEY: ssh-rsa REPLACE_WITH_GENERATED_PUBLIC_KEY
 
       - name: Verify Test 4
         shell: bash
         run: |
           echo "Verifying Test 4..."
+          if [ ! -f /tmp/docker_calls.log ]; then echo "Docker log not found!"; exit 1; fi
           cat /tmp/docker_calls.log
-          grep -q "DOCKER_MOCK_CALLED_WITH: login -u testuser --password-stdin fakeregistry.com" /tmp/docker_calls.log || (echo "Docker login not called as expected" && exit 1)
+          grep -q "DOCKER_MOCK_CALLED_WITH: login -u testuser --password-stdin fakeregistry.com" /tmp/docker_calls.log || exit 1
           echo "Test 4 Verification Successful"
           rm -f /tmp/docker_calls.log
 
-      # --- Test Case 5: Tailscale SSH (Conceptual - verifies SSH key setup is skipped) ---
-      - name: Test 5 - Tailscale SSH (mocked)
-        id: test5
+      # --- Test Case 5: Tailscale SSH (mocked - verifies action proceeds without explicit key inputs) ---
+      - name: Test 5 - Tailscale SSH
         uses: ./
         with:
-          remote_docker_host: root@localhost # Still need a host for docker context
+          remote_docker_host: root@localhost # Still need for Docker context setup
           ssh_port: 2222
-          tailscale_ssh: 'true' # Key aspect for this test
+          tailscale_ssh: 'true'
           args: "ps"
-          # No ssh_private_key or ssh_public_key provided
-        # For this test to pass without actual Tailscale, the action must gracefully handle
-        # the SSH connection attempt. The mock SSH server will still require some form of auth.
-        # The action should attempt to connect, and our mock docker should log calls.
-        # We need to ensure the SSH setup part of the action *doesn't* try to write id_rsa if tailscale_ssh is true.
-        # This test primarily verifies that the action *would* skip its own keygen if Tailscale is true.
-        # Actual Tailscale functionality cannot be tested here easily.
+          # ssh_private_key and ssh_public_key are intentionally omitted for this test case
 
       - name: Verify Test 5
         shell: bash
         run: |
-          echo "Verifying Test 5 (Tailscale SSH skip key setup)..."
-          # In the action, if tailscale_ssh is true, it shouldn't write to ~/.ssh/id_rsa
-          # This is harder to check directly from here without inspecting the action's execution environment.
-          # However, we can check that the Docker commands are still attempted,
-          # implying that the SSH setup part didn't fatally error due to missing keys.
+          echo "Verifying Test 5 (Tailscale SSH mode)..."
+          if [ ! -f /tmp/docker_calls.log ]; then echo "Docker log not found!"; exit 1; fi
           cat /tmp/docker_calls.log
-          grep -q "DOCKER_MOCK_CALLED_WITH: context create remote --docker host=ssh://root@localhost:2222" /tmp/docker_calls.log || (echo "Docker context create not called as expected (Tailscale)" && exit 1)
-          grep -q "DOCKER_MOCK_CALLED_WITH: compose -f docker-compose.yml ps" /tmp/docker_calls.log || (echo "Final docker compose ps not called as expected (Tailscale)" && exit 1)
-          echo "Test 5 Verification Successful (Tailscale logic path taken)"
+          # Essential Docker commands should still be logged by the mock
+          grep -q "DOCKER_MOCK_CALLED_WITH: context create remote --docker host=ssh://root@localhost:2222" /tmp/docker_calls.log || exit 1
+          grep -q "DOCKER_MOCK_CALLED_WITH: compose -f docker-compose.yml ps" /tmp/docker_calls.log || exit 1
+          echo "Test 5 Verification Successful"
           rm -f /tmp/docker_calls.log
-
-      # Placeholder for replacing keys in this YAML - this is a bit of a hack
-      # In a real scenario, you'd use secrets for actual keys, or generate them and output them to env vars properly.
-      - name: Update SSH keys in workflow file (TEMPORARY HACK)
-        run: |
-          PRIVATE_KEY_CONTENT=$(cat test_ssh_key | awk '{printf "%s\\n", $0}')
-          PUBLIC_KEY_CONTENT=$(cat test_ssh_key.pub)
-          # This is tricky because we can't easily modify the workflow file itself during the run for subsequent steps' env blocks.
-          # The env blocks are evaluated early.
-          # A better way: output keys to GITHUB_ENV for subsequent steps in *this job*.
-          echo "TEST_SSH_PRIVATE_KEY_CONTENT<<EOF" >> $GITHUB_ENV
-          cat test_ssh_key >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-          echo "TEST_SSH_PUBLIC_KEY_CONTENT=$(cat test_ssh_key.pub)" >> $GITHUB_ENV
-          echo "SSH keys set to GITHUB_ENV for subsequent steps in this job."
-
-  # This final step is to ensure the keys are correctly populated in the test steps
-  # The above 'Update SSH keys' step needs to run *before* any test case that uses them.
-  # The structure above is problematic because env blocks are processed early.
-  # Corrected approach: Generate keys, then have all test steps use them from files or GITHUB_ENV.
-
-  # Let's restructure:
-  # 1. Job to generate keys and pass them as outputs.
-  # 2. Subsequent job that uses these keys.
-  # OR, for simplicity in a single job:
-  # Generate keys -> set to GITHUB_ENV -> all test steps use `env.TEST_SSH_PRIVATE_KEY_CONTENT`
-
-  # The current structure has a flaw: the env: blocks in each 'uses: ./' step are static.
-  # They won't pick up keys generated within the same job in a prior step directly like that.
-  # I need to adjust how the keys are passed to the action.
-  # The easiest way is to read them from files that the 'Generate SSH keys' step creates.
-  # The action itself would then receive the *content* of these files.
-
-  # Let's refine the key generation and usage.
-  # The `env:` block for each `uses: ./` should be removed, and the `with:` block should read from files.
-  # Example: ssh_private_key: ${{ steps.generate_keys.outputs.private_key }}
-
-  # I will simplify the key injection for now by directly using cat in the `with` block.
-  # This is not ideal for multi-line private keys in YAML but works for demonstration.
-  # A better approach is to use `steps.<id>.outputs.<name>` after the key generation step.
-  # I will make this correction in the next iteration if this proves clunky.
-  # For now, the `REPLACE_WITH_GENERATED_PRIVATE_KEY` is a placeholder.
-  # The `Update SSH keys in workflow file (TEMPORARY HACK)` step is not effective as placed.
-  # I will remove it and assume the keys need to be manually inserted or a better mechanism used.
-
-  # For now, to make progress, I will assume the keys are available as secrets or manually placed for a first pass.
-  # The key generation part is more for setting up the *service container*.
-  # The action inputs `ssh_private_key` and `ssh_public_key` would typically come from secrets.
-
-  # Let's assume for the mock tests, we will use fixed dummy keys that are part of the repo,
-  # or I will use the generated ones and adjust the workflow to correctly pass them.
-
-  # Correcting the key passing strategy:
-  # The 'Generate SSH keys' step will output the key contents.
-  # Subsequent steps will use these outputs.
-  # I need to give the key generation step an ID.
-  # This is a significant change to the test structure.
-  # I will proceed with creating this file, and then refine the key passing in the next tool call if needed.
-  # The current `REPLACE_WITH_GENERATED_PRIVATE_KEY` will cause tests to fail until fixed.
-  # I will make a note to fix this specifically.
-  # The current version of the workflow has placeholders for keys.
-  # I will first write this file and then refine the key management.
